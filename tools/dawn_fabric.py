@@ -15,8 +15,12 @@ import os
 import platform
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -25,6 +29,10 @@ DEFAULT_HOME = Path(os.environ.get("DAWN_HOME", os.environ.get("HORIZON_HOME", R
 SHARED_MC = ROOT / ".local" / "minecraft"
 VERSION_1214_URL = "https://piston-meta.mojang.com/v1/packages/64843a304d7747da779448f853323962233f39ff/1.21.4.json"
 FABRIC_META = "https://meta.fabricmc.net/v2"
+
+# Microsoft OAuth Client ID công khai (được chứng thực cho launcher Minecraft Java)
+DEFAULT_MSA_CLIENT_ID = os.environ.get("DAWN_MSA_CLIENT_ID", os.environ.get("HORIZON_MSA_CLIENT_ID", "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb"))
+ACCOUNTS_FILE = DEFAULT_HOME / "accounts.json"
 
 
 def get_java_path():
@@ -288,6 +296,342 @@ def ensure_mcef_natives(inst_dir):
         return None
 
 
+def load_accounts():
+    """Đọc danh sách tài khoản đã lưu từ accounts.json."""
+    if not ACCOUNTS_FILE.exists():
+        return {"active": None, "accounts": {}}
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"active": None, "accounts": {}}
+
+
+def save_accounts(data):
+    """Lưu danh sách tài khoản vào accounts.json."""
+    ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def http_request(url, method="GET", data=None, headers=None, is_json=False):
+    """Thực hiện HTTP request tới API với xử lý mã lỗi và JSON."""
+    h = {"User-Agent": "Dawn-Launcher/1.0"}
+    if headers:
+        h.update(headers)
+    payload = None
+    if data is not None:
+        if is_json:
+            payload = json.dumps(data).encode("utf-8")
+            h["Content-Type"] = "application/json"
+            h["Accept"] = "application/json"
+        else:
+            payload = urllib.parse.urlencode(data).encode("utf-8")
+            h["Content-Type"] = "application/x-www-form-urlencoded"
+
+    req = urllib.request.Request(url, data=payload, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode("utf-8")
+            return resp.status, json.loads(content) if content else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {"error": raw}
+        return e.code, body
+
+
+def ms_exchange_tokens(ms_access_token):
+    """Chuyển đổi Microsoft access token sang Xbox Live -> XSTS -> Minecraft token."""
+    # 1. Xbox Live User Authenticate
+    xbl_body = {
+        "Properties": {
+            "AuthMethod": "RPS",
+            "SiteName": "user.auth.xboxlive.com",
+            "RpsTicket": f"d={ms_access_token}",
+        },
+        "RelyingParty": "http://auth.xboxlive.com",
+        "TokenType": "JWT",
+    }
+    status, xbl = http_request("https://user.auth.xboxlive.com/user/authenticate", method="POST", data=xbl_body, is_json=True)
+    if status != 200 or "Token" not in xbl:
+        raise ValueError(f"Xác thực Xbox Live thất bại: {xbl}")
+    xbl_token = xbl["Token"]
+
+    # 2. XSTS Authorize
+    xsts_body = {
+        "Properties": {
+            "SandboxId": "RETAIL",
+            "UserTokens": [xbl_token],
+        },
+        "RelyingParty": "rp://api.minecraftservices.com/",
+        "TokenType": "JWT",
+    }
+    status, xsts = http_request("https://xsts.auth.xboxlive.com/xsts/authorize", method="POST", data=xsts_body, is_json=True)
+    if "XErr" in xsts:
+        code = xsts["XErr"]
+        if code == 2148916233:
+            raise ValueError("Tài khoản chưa có hồ sơ Xbox. Vui lòng đăng nhập một lần tại xbox.com.")
+        elif code in (2148916236, 2148916237):
+            raise ValueError("Tài khoản cần xác minh độ tuổi người lớn trên xbox.com.")
+        elif code == 2148916238:
+            raise ValueError("Tài khoản trẻ em (Child account) cần được phụ huynh thêm vào Microsoft Family.")
+        else:
+            raise ValueError(f"Xbox Security (XSTS) từ chối xác thực (Mã lỗi: {code}).")
+
+    if status != 200 or "Token" not in xsts:
+        raise ValueError(f"Xác thực XSTS thất bại: {xsts}")
+
+    xsts_token = xsts["Token"]
+    claims = xsts.get("DisplayClaims", {}).get("xui", [{}])[0]
+    uhs = claims.get("uhs")
+    xuid = claims.get("xid", "")
+    if not uhs:
+        raise ValueError("Không tìm thấy user hash (uhs) trong phản hồi XSTS.")
+
+    # 3. Đăng nhập Minecraft Services
+    mc_body = {"identityToken": f"XBL3.0 x={uhs};{xsts_token}"}
+    status, mc = http_request("https://api.minecraftservices.com/authentication/login_with_xbox", method="POST", data=mc_body, is_json=True)
+    if status != 200 or "access_token" not in mc:
+        # Thử fallback qua launcher login
+        launcher_body = {"xtoken": f"XBL3.0 x={uhs};{xsts_token}", "platform": "PC_LAUNCHER"}
+        status, mc = http_request("https://api.minecraftservices.com/launcher/login", method="POST", data=launcher_body, is_json=True)
+        if status != 200 or "access_token" not in mc:
+            raise ValueError(f"Minecraft Services từ chối token: {mc}")
+
+    mc_token = mc["access_token"]
+    expires_in = mc.get("expires_in", 86400)
+    mc_expires_at = int(time.time()) + int(expires_in)
+
+    # 4. Kiểm tra hồ sơ Minecraft
+    status, prof = http_request(
+        "https://api.minecraftservices.com/minecraft/profile",
+        headers={"Authorization": f"Bearer {mc_token}"}
+    )
+    if status == 404 or "id" not in prof:
+        raise ValueError("Tài khoản Microsoft này chưa có hồ sơ Minecraft Java Edition (chưa tạo tên hoặc chưa mua game).")
+    if status != 200:
+        raise ValueError(f"Không thể đọc hồ sơ Minecraft: {prof}")
+
+    return {
+        "username": prof["name"],
+        "uuid": prof["id"],
+        "mc_token": mc_token,
+        "mc_expires_at": mc_expires_at,
+        "xuid": xuid,
+    }
+
+
+def refresh_account_if_needed(acc):
+    """Làm mới token Minecraft nếu sắp hết hạn (< 30 phút)."""
+    now = int(time.time())
+    if now < acc.get("mc_expires_at", 0) - 1800:
+        return acc
+
+    print(f"[-] Đang làm mới token đăng nhập Microsoft cho {acc.get('username')}...")
+    refresh_token = acc.get("ms_refresh_token")
+    if not refresh_token:
+        print("[!] Không tìm thấy refresh token. Vui lòng đăng nhập lại bằng: python tools/dawn_fabric.py login")
+        return acc
+
+    form = {
+        "grant_type": "refresh_token",
+        "client_id": DEFAULT_MSA_CLIENT_ID,
+        "refresh_token": refresh_token,
+        "scope": "XboxLive.signin offline_access",
+    }
+    status, res = http_request("https://login.microsoftonline.com/consumers/oauth2/v2.0/token", method="POST", data=form)
+    if status != 200 or "access_token" not in res:
+        print(f"[!] Không thể làm mới token Microsoft ({res.get('error_description', res.get('error'))}).")
+        return acc
+
+    new_ms_access = res["access_token"]
+    new_ms_refresh = res.get("refresh_token", refresh_token)
+
+    try:
+        updated = ms_exchange_tokens(new_ms_access)
+        updated["ms_refresh_token"] = new_ms_refresh
+        acc.update(updated)
+
+        data = load_accounts()
+        if "accounts" in data and acc["uuid"] in data["accounts"]:
+            data["accounts"][acc["uuid"]] = acc
+            save_accounts(data)
+        print(f"[+] Đã làm mới token thành công cho tài khoản {acc['username']}!")
+    except Exception as e:
+        print(f"[!] Lỗi khi cấp mới Minecraft token: {e}")
+
+    return acc
+
+
+def cmd_login(args):
+    """Đăng nhập tài khoản Microsoft bằng Device Code Flow."""
+    client_id = DEFAULT_MSA_CLIENT_ID
+    print("=" * 70)
+    print("  ĐĂNG NHẬP TÀI KHOẢN MICROSOFT (MINECRAFT PREMIUM / BẢN QUYỀN)")
+    print("=" * 70)
+
+    form = {
+        "client_id": client_id,
+        "scope": "XboxLive.signin offline_access",
+    }
+    status, d_res = http_request("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode", method="POST", data=form)
+    if status != 200 or "user_code" not in d_res:
+        print(f"[!] Lỗi khi yêu cầu Device Code: {d_res}")
+        return
+
+    user_code = d_res["user_code"]
+    verify_url = d_res.get("verification_uri", "https://www.microsoft.com/link")
+    device_code = d_res["device_code"]
+    interval = max(int(d_res.get("interval", 5)), 1)
+    expires_in = int(d_res.get("expires_in", 900))
+    deadline = time.time() + expires_in
+
+    print(f"\n1. Mở trang đăng nhập: {verify_url}")
+    print(f"2. Nhập mã code sau:   >>>  {user_code}  <<<")
+    print(f"3. Đăng nhập tài khoản Microsoft sở hữu Minecraft: Java Edition.")
+    print("=" * 70)
+
+    try:
+        webbrowser.open(verify_url)
+    except Exception:
+        pass
+
+    print(f"Đang chờ bạn hoàn tất đăng nhập trên trình duyệt (hết hạn sau {expires_in // 60} phút)...")
+
+    ms_access = None
+    ms_refresh = None
+
+    poll_form = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "client_id": client_id,
+        "device_code": device_code,
+    }
+
+    while time.time() < deadline:
+        time.sleep(interval)
+        status, t_res = http_request("https://login.microsoftonline.com/consumers/oauth2/v2.0/token", method="POST", data=poll_form)
+        if status == 200 and "access_token" in t_res:
+            ms_access = t_res["access_token"]
+            ms_refresh = t_res.get("refresh_token")
+            break
+
+        err = t_res.get("error")
+        if err == "authorization_pending":
+            continue
+        elif err == "slow_down":
+            interval += 5
+            continue
+        elif err == "expired_token":
+            print("[!] Mã xác thực đã hết hạn. Vui lòng thử lại.")
+            return
+        elif err == "authorization_declined":
+            print("[!] Bạn đã từ chối yêu cầu đăng nhập trên trình duyệt.")
+            return
+        else:
+            print(f"[!] Lỗi đăng nhập: {t_res.get('error_description', err)}")
+            return
+
+    if not ms_access:
+        print("[!] Hết thời gian chờ đăng nhập.")
+        return
+
+    print("\n[-] Đã nhận token Microsoft. Đang kết nối Xbox Live và Minecraft Services...")
+    try:
+        acc_info = ms_exchange_tokens(ms_access)
+        acc_info["ms_refresh_token"] = ms_refresh
+
+        data = load_accounts()
+        uuid_str = acc_info["uuid"]
+        data["accounts"][uuid_str] = acc_info
+        data["active"] = uuid_str
+        save_accounts(data)
+
+        print("=" * 70)
+        print(f"[+] ĐĂNG NHẬP THÀNH CÔNG!")
+        print(f"    Tên nhân vật (IGN): {acc_info['username']}")
+        print(f"    UUID:               {acc_info['uuid']}")
+        print(f"    Tài khoản này đã được đặt làm tài khoản mặc định để chơi game.")
+        print("=" * 70)
+    except Exception as e:
+        print(f"[!] Lỗi khi lấy thông tin Minecraft: {e}")
+
+
+def cmd_accounts(args):
+    """Liệt kê danh sách các tài khoản Microsoft đã lưu."""
+    data = load_accounts()
+    active_uuid = data.get("active")
+    accounts = data.get("accounts", {})
+
+    if not accounts:
+        print("[-] Hiện chưa có tài khoản Microsoft nào được lưu.")
+        print("    Chạy lệnh sau để đăng nhập: python tools/dawn_fabric.py login")
+        return
+
+    print(f"Danh sách tài khoản ({len(accounts)}):")
+    for u, acc in accounts.items():
+        tag = " [ĐANG CHỌN]" if u == active_uuid else ""
+        print(f"  - {acc.get('username', 'Unknown')} (UUID: {u}){tag}")
+
+
+def cmd_select(args):
+    """Chọn tài khoản Microsoft làm mặc định."""
+    data = load_accounts()
+    accounts = data.get("accounts", {})
+    target = args.username.lower()
+
+    found = None
+    for u, acc in accounts.items():
+        if acc.get("username", "").lower() == target or u.lower() == target:
+            found = u
+            break
+
+    if not found:
+        print(f"[!] Không tìm thấy tài khoản '{args.username}' trong danh sách đã lưu.")
+        return
+
+    data["active"] = found
+    save_accounts(data)
+    print(f"[+] Đã chọn tài khoản: {accounts[found].get('username')} ({found})")
+
+
+def cmd_logout(args):
+    """Đăng xuất tài khoản Microsoft khỏi máy."""
+    data = load_accounts()
+    accounts = data.get("accounts", {})
+    if not accounts:
+        print("[-] Không có tài khoản nào được lưu.")
+        return
+
+    target = args.username
+    if not target:
+        target = data.get("active")
+        if not target:
+            print("[!] Vui lòng chỉ định tên tài khoản cần đăng xuất.")
+            return
+
+    target_l = target.lower()
+    found = None
+    for u, acc in accounts.items():
+        if acc.get("username", "").lower() == target_l or u.lower() == target_l:
+            found = u
+            break
+
+    if not found:
+        print(f"[!] Không tìm thấy tài khoản '{target}'.")
+        return
+
+    name = accounts[found].get("username", found)
+    del accounts[found]
+    if data.get("active") == found:
+        data["active"] = next(iter(accounts.keys())) if accounts else None
+
+    save_accounts(data)
+    print(f"[+] Đã đăng xuất tài khoản: {name}")
+
+
 def cmd_run(args):
     """Khởi chạy instance 1.21.4 Fabric kèm mods."""
     inst_dir = DEFAULT_HOME / "instances" / args.name
@@ -317,7 +661,39 @@ def cmd_run(args):
 
     java_bin = get_java_path()
     memory = args.memory or "6G"
-    player_uuid = get_offline_uuid(args.username)
+
+    # Xác định tài khoản người chơi (Microsoft Account hoặc Offline)
+    data = load_accounts()
+    active_uuid = data.get("active")
+    accounts = data.get("accounts", {})
+    account = None
+
+    if not getattr(args, "offline", False):
+        if getattr(args, "account", None):
+            target = args.account.lower()
+            for u, a in accounts.items():
+                if a.get("username", "").lower() == target or u.lower() == target:
+                    account = a
+                    break
+        elif active_uuid and active_uuid in accounts:
+            account = accounts[active_uuid]
+
+    if account:
+        account = refresh_account_if_needed(account)
+        player_name = account["username"]
+        player_uuid = account["uuid"]
+        access_token = account["mc_token"]
+        user_type = "msa"
+        xuid = account.get("xuid", "")
+        print(f"[+] Sử dụng tài khoản Microsoft (Premium): {player_name} (UUID: {player_uuid})")
+    else:
+        player_name = args.username
+        player_uuid = get_offline_uuid(player_name)
+        access_token = "0"
+        user_type = "legacy"
+        xuid = ""
+        print(f"[-] Chơi ở chế độ Offline: {player_name} (UUID: {player_uuid})")
+        print(f"    (Để dùng tài khoản Premium bản quyền, chạy: python tools/dawn_fabric.py login)")
 
     # Extra JVM args từ Fabric & MCEF
     extra_jvm = []
@@ -348,7 +724,7 @@ def cmd_run(args):
         classpath,
         main_class,
         "--username",
-        args.username,
+        player_name,
         "--version",
         "1.21.4",
         "--gameDir",
@@ -360,8 +736,15 @@ def cmd_run(args):
         "--uuid",
         player_uuid,
         "--accessToken",
-        "0",
+        access_token,
+        "--userType",
+        user_type,
+        "--versionType",
+        "release",
     ]
+
+    if xuid:
+        cmd.extend(["--xuid", xuid])
 
     print(f"[+] Khởi chạy Dawn (Minecraft 1.21.4 Fabric) cho instance '{args.name}'...")
     print(f"    Java: {java_bin}")
@@ -379,6 +762,21 @@ def main():
     parser = argparse.ArgumentParser(description="Dawn Launcher CLI - Minecraft 1.21.4 Fabric Runner")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    # Quản lý tài khoản Microsoft
+    p_login = sub.add_parser("login", help="Đăng nhập tài khoản Microsoft (Minecraft Premium)")
+    p_login.set_defaults(func=cmd_login)
+
+    p_accounts = sub.add_parser("accounts", help="Xem danh sách tài khoản Microsoft đã lưu")
+    p_accounts.set_defaults(func=cmd_accounts)
+
+    p_select = sub.add_parser("select", help="Chọn tài khoản Microsoft làm mặc định")
+    p_select.add_argument("username", help="Tên người chơi (IGN) hoặc UUID")
+    p_select.set_defaults(func=cmd_select)
+
+    p_logout = sub.add_parser("logout", help="Đăng xuất tài khoản Microsoft")
+    p_logout.add_argument("username", nargs="?", help="Tên tài khoản (để trống để đăng xuất tài khoản đang chọn)")
+    p_logout.set_defaults(func=cmd_logout)
+
     p_create = sub.add_parser("create", help="Tạo instance 1.21.4 Fabric mới")
     p_create.add_argument("name", help="Tên instance (vd: MyFabricWorld)")
     p_create.add_argument("--loader-version", help="Phiên bản Fabric Loader (mặc định: stable mới nhất)")
@@ -390,9 +788,11 @@ def main():
 
     p_run = sub.add_parser("run", help="Chạy game 1.21.4 Fabric")
     p_run.add_argument("name", help="Tên instance")
-    p_run.add_argument("--username", default="DawnPlayer", help="Tên người chơi")
+    p_run.add_argument("--username", default="DawnPlayer", help="Tên người chơi offline")
     p_run.add_argument("--memory", default="6G", help="Dung lượng RAM (vd: 6G, 8G)")
     p_run.add_argument("--loader-version", help="Phiên bản Fabric Loader")
+    p_run.add_argument("--offline", action="store_true", help="Chơi ở chế độ Offline (bỏ qua tài khoản Microsoft)")
+    p_run.add_argument("--account", help="Chỉ định tài khoản Microsoft muốn dùng")
     p_run.set_defaults(func=cmd_run)
 
     args = parser.parse_args()
