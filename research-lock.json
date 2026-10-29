@@ -1,0 +1,63 @@
+{
+  "minecraft": {
+    "version": "1.21.4",
+    "manifest_sha1": "64843a304d7747da779448f853323962233f39ff",
+    "accepted_manifest_sha1": [
+      "64843a304d7747da779448f853323962233f39ff"
+    ],
+    "accepted_manifest_note": "Minecraft 1.21.4 release manifest",
+    "accepted_asset_index_sha1": [
+      "54842101298f1258c7076491af2fad4702fd3523"
+    ],
+    "accepted_asset_index_note": "Asset index 19 for 1.21.4",
+    "client_sha1": "a7e5a6024bfd3cd614625aa05629adf760020304",
+    "server_sha1": "4707d00eb834b446575d89a61a11b5d548d8c001",
+    "java_major": 21
+  },
+  "vineflower": {
+    "version": "1.12.0",
+    "url": "https://github.com/Vineflower/vineflower/releases/download/1.12.0/vineflower-1.12.0.jar",
+    "sha256": "1dfcfe974395734fa467ce620661c7623d05ba83670de0529b1fbd63ff548b9d"
+  },
+  "rea": {
+    "package": "rea-agents",
+    "version": "6.4.0"
+  },
+  "jadx_headless_mcp": {
+    "version": "0.7.1",
+    "url": "https://github.com/1013503897/jadx-headless-mcp/releases/download/v0.7.1/jadx-headless-mcp-0.7.1-all.jar",
+    "sha256": "6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75"
+  },
+  "java_runtimes": {
+    "note": "Mojang's Java runtimes for the old server jars that make the datafix sample worlds (tools/datafix_worlds.py). A component a platform lacks falls back to java-runtime-gamma.",
+    "linux": {
+      "jre-legacy": {
+        "version": "8u202",
+        "manifest_url": "https://piston-meta.mojang.com/v1/packages/c529f68a6febc042e71835a579f44d55a3717c46/manifest.json",
+        "manifest_sha1": "c529f68a6febc042e71835a579f44d55a3717c46"
+      },
+      "java-runtime-alpha": {
+        "version": "16.0.1.9.1",
+        "manifest_url": "https://piston-meta.mojang.com/v1/packages/3bfc5fdcc28d8897aa12f372ea98a9afeb11a813/manifest.json",
+        "manifest_sha1": "3bfc5fdcc28d8897aa12f372ea98a9afeb11a813"
+      },
+      "java-runtime-beta": {
+        "version": "17.0.15",
+        "manifest_url": "https://piston-meta.mojang.com/v1/packages/4be835c1384c4bf1ebcb5c3bfe999ad2b1fe88ac/manifest.json",
+        "manifest_sha1": "4be835c1384c4bf1ebcb5c3bfe999ad2b1fe88ac"
+      },
+      "java-runtime-gamma": {
+        "version": "17.0.15",
+        "manifest_url": "https://piston-meta.mojang.com/v1/packages/71651340afda9fe593026fa7c56b1d9e2dbc1292/manifest.json",
+        "manifest_sha1": "71651340afda9fe593026fa7c56b1d9e2dbc1292"
+      }
+    },
+    "mac-os-arm64": {
+      "java-runtime-gamma": {
+        "version": "17.0.15",
+        "manifest_url": "https://piston-meta.mojang.com/v1/packages/e0c8d5ccfe8cfb38075ff1b7f6352d7b03fd7868/manifest.json",
+        "manifest_sha1": "e0c8d5ccfe8cfb38075ff1b7f6352d7b03fd7868"
+      }
+    }
+  }
+}

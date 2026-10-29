@@ -1,0 +1,21 @@
+//! What Minecraft 1.21.4 states about itself (the client jar's `version.json`,
+//! `SharedConstants.getCurrentVersion()`). Ported for Dawn.
+
+/// `WorldVersion.id()`.
+pub const VERSION_ID: &str = "1.21.4";
+/// `WorldVersion.name()`: level.dat, the server list, crash reports.
+pub const VANILLA_VERSION: &str = "1.21.4";
+/// `SharedConstants.getProtocolVersion()`.
+pub const PROTOCOL_VERSION: i32 = 769;
+/// `WorldVersion.dataVersion()`: the DataVersion of saved chunks, entities and level.dat.
+pub const DATA_VERSION: i32 = 4189;
+/// `WorldVersion.packVersion(PackType.CLIENT_RESOURCES)`: (major, minor).
+pub const RESOURCE_PACK_FORMAT: (i64, i64) = (46, 0);
+/// `WorldVersion.packVersion(PackType.SERVER_DATA)`: (major, minor).
+pub const DATA_PACK_FORMAT: (i64, i64) = (61, 0);
+/// The Java major version the game runs on.
+pub const JAVA_VERSION: u32 = 21;
+/// `WorldVersion.stable()`: false for snapshots and pre-releases.
+pub const STABLE: bool = true;
+/// `WorldVersion.buildTime()` as `Date.toString()` prints it in UTC (`/version`).
+pub const BUILD_TIME: &str = "Tue Dec 03 10:12:57 UTC 2024";
