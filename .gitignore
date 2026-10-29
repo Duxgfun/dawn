@@ -34,3 +34,5 @@
 
 # Release-only compiled original exporter bundle.
 /exporters/
+/config/
+/local/

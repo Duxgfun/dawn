@@ -75,16 +75,26 @@ def get_latest_fabric_loader():
     return data[0]["loader"]["version"]
 
 
+def library_key(name):
+    """Tách key group:artifact (hoặc kèm classifier) để đối chiếu thư viện."""
+    parts = name.split(":")
+    if len(parts) >= 4:
+        return f"{parts[0]}:{parts[1]}:{parts[3]}"
+    elif len(parts) >= 2:
+        return f"{parts[0]}:{parts[1]}"
+    return name
+
+
 def rule_allowed(rules):
     if not rules:
         return True
     allowed = False
+    cur_os = "windows" if platform.system() == "Windows" else ("osx" if platform.system() == "Darwin" else "linux")
     for r in rules:
         action = r.get("action") == "allow"
         os_rule = r.get("os", {})
         name = os_rule.get("name")
         if name:
-            cur_os = "windows" if platform.system() == "Windows" else ("osx" if platform.system() == "Darwin" else "linux")
             if name == cur_os:
                 allowed = action
         else:
@@ -92,14 +102,41 @@ def rule_allowed(rules):
     return allowed
 
 
-def prepare_vanilla():
-    """Tải và chuẩn bị Minecraft 1.21.4 từ Mojang."""
+def prepare_fabric(loader_version):
+    """Tải và chuẩn bị Fabric profile cùng thư viện."""
+    print(f"[-] Chuẩn bị Fabric Loader v{loader_version} cho Minecraft 1.21.4...")
+    url = f"{FABRIC_META}/versions/loader/1.21.4/{loader_version}/profile/json"
+    req = urllib.request.Request(url, headers={"User-Agent": "Dawn-Launcher/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        profile = json.loads(resp.read())
+
+    fabric_libs = []
+    fabric_keys = set()
+    lib_dir = SHARED_MC / "libraries"
+    for lib in profile.get("libraries", []):
+        name = lib["name"]
+        fabric_keys.add(library_key(name))
+        parts = name.split(":")
+        group, artifact, ver = parts[0].replace(".", "/"), parts[1], parts[2]
+        rel_path = f"{group}/{artifact}/{ver}/{artifact}-{ver}.jar"
+        lib_url = lib.get("url", "https://maven.fabricmc.net/") + rel_path
+        dest = lib_dir / rel_path
+        download_file(lib_url, dest)
+        fabric_libs.append(str(dest))
+
+    main_class = profile.get("mainClass", "net.fabricmc.loader.impl.launch.knot.KnotClient")
+    return profile, fabric_libs, fabric_keys, main_class
+
+
+def prepare_vanilla(fabric_keys=None):
+    """Tải và chuẩn bị Minecraft 1.21.4 từ Mojang (loại bỏ thư viện trùng lặp với Fabric)."""
+    fabric_keys = fabric_keys or set()
     print("[-] Kiểm tra dữ liệu Minecraft 1.21.4 từ Mojang...")
     SHARED_MC.mkdir(parents=True, exist_ok=True)
     vjson_path = SHARED_MC / "1.21.4.json"
     download_file(VERSION_1214_URL, vjson_path)
     with open(vjson_path, "r", encoding="utf-8") as f:
-        vdata = json.loads(f.read())
+        vdata = json.load(f)
 
     # Tải client.jar
     client_dl = vdata["downloads"]["client"]
@@ -110,8 +147,19 @@ def prepare_vanilla():
     libs = []
     lib_dir = SHARED_MC / "libraries"
     for lib in vdata.get("libraries", []):
+        lib_name = lib.get("name", "")
         if not rule_allowed(lib.get("rules")):
             continue
+
+        # Trên Windows x64, bỏ qua các bản natives arm64 và x86
+        if platform.system() == "Windows":
+            if ":natives-windows-arm64" in lib_name or ":natives-windows-x86" in lib_name:
+                continue
+
+        # Nếu Fabric đã cung cấp thư viện cùng group:artifact (ví dụ ASM), ưu tiên Fabric
+        if library_key(lib_name) in fabric_keys:
+            continue
+
         artifact = lib.get("downloads", {}).get("artifact")
         if artifact:
             dest = lib_dir / artifact["path"]
@@ -127,28 +175,13 @@ def prepare_vanilla():
     return vdata, client_jar, libs
 
 
-def prepare_fabric(loader_version):
-    """Tải và chuẩn bị Fabric profile cùng thư viện."""
-    print(f"[-] Chuẩn bị Fabric Loader v{loader_version} cho Minecraft 1.21.4...")
-    url = f"{FABRIC_META}/versions/loader/1.21.4/{loader_version}/profile/json"
-    req = urllib.request.Request(url, headers={"User-Agent": "Dawn-Launcher/1.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        profile = json.loads(resp.read())
-
-    fabric_libs = []
-    lib_dir = SHARED_MC / "libraries"
-    for lib in profile.get("libraries", []):
-        name = lib["name"]
-        parts = name.split(":")
-        group, artifact, ver = parts[0].replace(".", "/"), parts[1], parts[2]
-        rel_path = f"{group}/{artifact}/{ver}/{artifact}-{ver}.jar"
-        lib_url = lib.get("url", "https://maven.fabricmc.net/") + rel_path
-        dest = lib_dir / rel_path
-        download_file(lib_url, dest)
-        fabric_libs.append(str(dest))
-
-    main_class = profile.get("mainClass", "net.fabricmc.loader.impl.launch.knot.KnotClient")
-    return profile, fabric_libs, main_class
+def get_offline_uuid(name):
+    """Tạo offline UUID chuẩn theo thuật toán Java UUID.nameUUIDFromBytes."""
+    md5 = hashlib.md5(f"OfflinePlayer:{name}".encode("utf-8")).digest()
+    b = bytearray(md5)
+    b[6] = (b[6] & 0x0F) | 0x30
+    b[8] = (b[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(b)))
 
 
 def cmd_create(args):
@@ -201,17 +234,27 @@ def cmd_run(args):
         cfg = json.load(f)
 
     loader_version = cfg.get("loader_version") or get_latest_fabric_loader()
-    vdata, client_jar, vanilla_libs = prepare_vanilla()
-    profile, fabric_libs, main_class = prepare_fabric(loader_version)
+    profile, fabric_libs, fabric_keys, main_class = prepare_fabric(loader_version)
+    vdata, client_jar, vanilla_libs = prepare_vanilla(fabric_keys)
 
-    # Classpath
+    # Classpath: Thư viện Fabric lên trước, sau đó là thư viện vanilla đã deduplicate, cuối cùng là client.jar
     all_libs = fabric_libs + vanilla_libs + [str(client_jar)]
     sep = ";" if platform.system() == "Windows" else ":"
     classpath = sep.join(all_libs)
 
+    # Natives dir
+    natives_dir = SHARED_MC / "natives"
+    natives_dir.mkdir(parents=True, exist_ok=True)
+
     java_bin = get_java_path()
     memory = args.memory or "4G"
-    offline_uuid = str(uuid.uuid3(uuid.NAMESPACE_DNS, args.username))
+    player_uuid = get_offline_uuid(args.username)
+
+    # Extra JVM args từ Fabric
+    extra_jvm = []
+    for arg in profile.get("arguments", {}).get("jvm", []):
+        if isinstance(arg, str):
+            extra_jvm.append(arg.strip())
 
     cmd = [
         java_bin,
@@ -222,7 +265,9 @@ def cmd_run(args):
         "-XX:G1ReservePercent=20",
         "-XX:MaxGCPauseMillis=50",
         "-XX:G1HeapRegionSize=32M",
-        f"-Djava.library.path={SHARED_MC}/natives",
+        f"-Djava.library.path={natives_dir}",
+        f"-Dorg.lwjgl.system.SharedLibraryExtractPath={natives_dir}",
+    ] + extra_jvm + [
         "-cp",
         classpath,
         main_class,
@@ -237,7 +282,7 @@ def cmd_run(args):
         "--assetIndex",
         "19",
         "--uuid",
-        offline_uuid,
+        player_uuid,
         "--accessToken",
         "0",
     ]
