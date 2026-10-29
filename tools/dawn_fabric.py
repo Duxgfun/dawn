@@ -5,7 +5,7 @@ Hỗ trợ đầy đủ việc tải game, cài đặt Fabric loader và nạp m
 Sử dụng:
     python tools/dawn_fabric.py create MyWorld
     python tools/dawn_fabric.py list-mods MyWorld
-    python tools/dawn_fabric.py run MyWorld
+    python tools/dawn_fabric.py run MyWorld --memory 6G
 """
 
 import argparse
@@ -17,6 +17,7 @@ import subprocess
 import sys
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,6 +103,36 @@ def rule_allowed(rules):
     return allowed
 
 
+def download_assets(index_path):
+    """Tải các asset thiết yếu (font, icons, resourcepacks, lang, textures) để tránh lỗi NoSuchFileException."""
+    with open(index_path, "r", encoding="utf-8") as f:
+        idx = json.load(f)
+
+    to_download = []
+    for name, obj in idx.get("objects", {}).items():
+        h = obj["hash"]
+        dest = SHARED_MC / "assets" / "objects" / h[:2] / h
+        if not (dest.exists() and dest.stat().st_size == obj["size"]):
+            # Ưu tiên các file thiết yếu (không phải sound)
+            if not name.startswith("minecraft/sounds/"):
+                to_download.append((h, dest, obj["size"]))
+
+    if to_download:
+        print(f"[-] Đang tải bổ sung {len(to_download)} asset thiết yếu (fonts, textures, icons)...")
+
+        def fetch(item):
+            h, dest, _ = item
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            url = f"https://resources.download.minecraft.net/{h[:2]}/{h}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Dawn-Launcher/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                dest.write_bytes(r.read())
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(fetch, to_download))
+        print("[✓] Đã tải xong toàn bộ asset thiết yếu.")
+
+
 def prepare_fabric(loader_version):
     """Tải và chuẩn bị Fabric profile cùng thư viện."""
     print(f"[-] Chuẩn bị Fabric Loader v{loader_version} cho Minecraft 1.21.4...")
@@ -166,11 +197,12 @@ def prepare_vanilla(fabric_keys=None):
             download_file(artifact["url"], dest, artifact.get("sha1"))
             libs.append(str(dest))
 
-    # Tải asset index
+    # Tải asset index và các asset thiết yếu
     asset_index_info = vdata.get("assetIndex", {})
     if asset_index_info:
         asset_idx_path = SHARED_MC / "assets" / "indexes" / f"{asset_index_info['id']}.json"
         download_file(asset_index_info["url"], asset_idx_path, asset_index_info.get("sha1"))
+        download_assets(asset_idx_path)
 
     return vdata, client_jar, libs
 
@@ -247,7 +279,7 @@ def cmd_run(args):
     natives_dir.mkdir(parents=True, exist_ok=True)
 
     java_bin = get_java_path()
-    memory = args.memory or "4G"
+    memory = args.memory or "6G"
     player_uuid = get_offline_uuid(args.username)
 
     # Extra JVM args từ Fabric
@@ -310,7 +342,7 @@ def main():
     p_run = sub.add_parser("run", help="Chạy game 1.21.4 Fabric")
     p_run.add_argument("name", help="Tên instance")
     p_run.add_argument("--username", default="DawnPlayer", help="Tên người chơi")
-    p_run.add_argument("--memory", default="4G", help="Dung lượng RAM (vd: 4G, 6G)")
+    p_run.add_argument("--memory", default="6G", help="Dung lượng RAM (vd: 6G, 8G)")
     p_run.add_argument("--loader-version", help="Phiên bản Fabric Loader")
     p_run.set_defaults(func=cmd_run)
 
