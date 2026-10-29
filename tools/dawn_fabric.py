@@ -254,6 +254,40 @@ def cmd_list_mods(args):
         print(f"  - {m.name} ({m.stat().st_size // 1024} KB)")
 
 
+def ensure_mcef_natives(inst_dir):
+    """Tự động kiểm tra và tải thư viện Chromium/CEF cho MCEF mod nếu có."""
+    mods_dir = inst_dir / "mods"
+    if not mods_dir.exists():
+        return None
+    has_mcef = any("mcef" in p.name.lower() for p in mods_dir.glob("*.jar"))
+    if not has_mcef:
+        return None
+
+    mcef_lib_dir = mods_dir / "mcef-libraries"
+    mcef_native = mcef_lib_dir / "windows_amd64"
+    if mcef_native.exists() and (mcef_native / "jcef.dll").exists():
+        return mcef_native
+
+    mcef_lib_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = mcef_lib_dir / "windows_amd64.tar.gz"
+    url = "https://mcef-download.cinemamod.com/java-cef-builds/eaeb3d4370aa3526ee237ad1981ad59af3de4dd1/windows_amd64.tar.gz"
+    print("[-] Đang tự động tải thư viện Chromium CEF cho MCEF mod (~118 MB)...")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as resp, open(tar_path, "wb") as f:
+            while chunk := resp.read(1024 * 1024):
+                f.write(chunk)
+        import tarfile
+        print("[-] Đang giải nén thư viện Chromium CEF...")
+        with tarfile.open(tar_path, "r:gz") as tar:
+            tar.extractall(mcef_lib_dir)
+        print("[+] Đã cài đặt thư viện native Chromium CEF thành công!")
+        return mcef_native
+    except Exception as e:
+        print(f"[!] Cảnh báo: Không thể tải CEF native tự động: {e}")
+        return None
+
+
 def cmd_run(args):
     """Khởi chạy instance 1.21.4 Fabric kèm mods."""
     inst_dir = DEFAULT_HOME / "instances" / args.name
@@ -274,19 +308,29 @@ def cmd_run(args):
     sep = ";" if platform.system() == "Windows" else ":"
     classpath = sep.join(all_libs)
 
-    # Natives dir
+    # Natives dir & MCEF native libraries
     natives_dir = SHARED_MC / "natives"
     natives_dir.mkdir(parents=True, exist_ok=True)
+
+    mcef_native = ensure_mcef_natives(inst_dir)
+    mcef_lib_dir = inst_dir / "mods" / "mcef-libraries"
 
     java_bin = get_java_path()
     memory = args.memory or "6G"
     player_uuid = get_offline_uuid(args.username)
 
-    # Extra JVM args từ Fabric
+    # Extra JVM args từ Fabric & MCEF
     extra_jvm = []
     for arg in profile.get("arguments", {}).get("jvm", []):
         if isinstance(arg, str):
             extra_jvm.append(arg.strip())
+
+    if mcef_native and mcef_native.exists():
+        java_lib_path = f"{natives_dir};{mcef_native}"
+        extra_jvm.append(f"-Dmcef.libraries.path={mcef_lib_dir}")
+        extra_jvm.append(f"-Djcef.path={mcef_native}")
+    else:
+        java_lib_path = str(natives_dir)
 
     cmd = [
         java_bin,
@@ -297,7 +341,7 @@ def cmd_run(args):
         "-XX:G1ReservePercent=20",
         "-XX:MaxGCPauseMillis=50",
         "-XX:G1HeapRegionSize=32M",
-        f"-Djava.library.path={natives_dir}",
+        f"-Djava.library.path={java_lib_path}",
         f"-Dorg.lwjgl.system.SharedLibraryExtractPath={natives_dir}",
     ] + extra_jvm + [
         "-cp",
@@ -323,7 +367,12 @@ def cmd_run(args):
     print(f"    Java: {java_bin}")
     print(f"    Bộ nhớ (RAM): {memory}")
     print(f"    Thư mục mods: {inst_dir / 'mods'}")
-    subprocess.run(cmd)
+
+    env = dict(os.environ)
+    if mcef_native and mcef_native.exists():
+        env["PATH"] = f"{mcef_native};" + env.get("PATH", "")
+
+    subprocess.run(cmd, env=env, cwd=inst_dir)
 
 
 def main():
